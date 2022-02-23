@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-
+import random
 from dataclasses import dataclass
 from itertools import product
 
@@ -148,20 +148,23 @@ class DRCollactor(DataCollatorWithPadding):
 
 
 class Preprocessor:
-    def __init__(self, split):
-        self.split = split
-        self.split_map = {"train": 1, "dev": 2, "test": 3}
+    def __init__(self):
+        self.rand = random.Random()
 
     def __call__(self, data):
-        data['labels'] = [1] + [0] * (len(data['passage']) - 1)
-        data['split'] = self.split_map[self.split]
+        labels = [1] + [0] * (len(data['passage']) - 1)
+        swap_idx = self.rand.randint(0, len(data['passage'])-1)
+        labels[0], labels[swap_idx] = labels[swap_idx], labels[0]
+        data['passage'][0], data['passage'][swap_idx] = data['passage'][swap_idx], data['passage'][0]
+        data['labels'] = labels
         return data
 
 
 if __name__ == '__main__':
     dataset = load_dataset("json", data_files="sample_1000_abs.jsonl", split="train")
-    train_set = dataset.map(Preprocessor('train'))
-    dev_set = dataset.select(range(100)).map(Preprocessor('dev'))
+    dataset = dataset.train_test_split(train_size=0.8, seed=42)
+    train_set = dataset['train'].map(Preprocessor())
+    dev_set = dataset['test'].map(Preprocessor())
 
     tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
     encoder = AutoModel.from_pretrained('Luyu/co-condenser-marco')
@@ -171,7 +174,7 @@ if __name__ == '__main__':
 
     training_args = TrainingArguments("model_output",
                                       learning_rate=5e-6,
-                                      num_train_epochs=3,
+                                      num_train_epochs=30,
                                       per_device_train_batch_size=16,
                                       evaluation_strategy='steps',
                                       eval_steps=100,
@@ -192,6 +195,3 @@ if __name__ == '__main__':
 
     trainer.train()
     trainer.save_model()
-
-
-
