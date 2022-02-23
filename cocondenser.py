@@ -177,7 +177,7 @@ if __name__ == '__main__':
                                       eval_steps=100,
                                       save_steps=100,
                                       load_best_model_at_end=True,
-                                      metric_for_best_model="MMR",
+                                      metric_for_best_model="mmr",
                                       remove_unused_columns=False)
     trainer = DenseTrainer(
         model=model,
