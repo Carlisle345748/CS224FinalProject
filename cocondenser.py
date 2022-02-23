@@ -174,7 +174,7 @@ if __name__ == '__main__':
                                       num_train_epochs=3,
                                       per_device_train_batch_size=16,
                                       evaluation_strategy='steps',
-                                      eval_steps=1,
+                                      eval_steps=100,
                                       save_steps=100,
                                       load_best_model_at_end=True,
                                       metric_for_best_model="MMR",
