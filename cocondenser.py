@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 
+from dataclasses import dataclass
+from itertools import product
+
 import torch
+import torch.nn as nn
+from datasets import load_dataset
+from torch import Tensor
 from transformers import AutoTokenizer, AutoModel, PreTrainedModel, DataCollatorWithPadding, TrainingArguments, Trainer
 from transformers.modeling_outputs import ModelOutput
-from datasets import load_dataset
-from dataclasses import dataclass
-import torch.nn as nn
-from torch import Tensor
-import os
-import numpy as np
-from itertools import product
-import torch.nn.functional as F
-from sklearn.metrics import ndcg_score
+from metrics import ComputeMetrics
+from trainer import DenseTrainer
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 
 @dataclass
 class DenseOutput(ModelOutput):
@@ -21,6 +21,7 @@ class DenseOutput(ModelOutput):
     p_reps: Tensor = None
     loss: Tensor = None
     scores: Tensor = None
+    hidden_loss: Tensor = None
 
 
 class CondenserLTR(nn.Module):
@@ -43,7 +44,7 @@ class CondenserLTR(nn.Module):
         p_reps = p_hidden[:, 0]
         return p_hidden, p_reps
 
-    def forward(self, query: Tensor, passage: Tensor):
+    def forward(self, query: Tensor, passage: Tensor, labels: Tensor):
         # Encode queries and passages
         q_hidden, q_reps = self.encode_query(query)
         p_hidden, p_reps = self.encode_passage(passage)
@@ -55,16 +56,10 @@ class CondenserLTR(nn.Module):
         ltr_input = ltr_input.view(batch_size, -1, q_reps.size(1) + p_reps.size(1))
 
         # Run LTR model
-        scores, loss = self.ltr(ltr_input)
-
-        return DenseOutput(loss=loss, scores=scores, q_reps=q_reps, p_reps=p_reps)
-
-    def save(self, output_dir: str):
-        os.makedirs(os.path.join(output_dir, 'query_model'))
-        os.makedirs(os.path.join(output_dir, 'passage_model'))
-        self.q_enc.save_pretrained(os.path.join(output_dir, 'query_model'))
-        self.p_enc.save_pretrained(os.path.join(output_dir, 'passage_model'))
-        torch.save(self.ltr.state_dict(), "ltr_model")
+        scores, loss = self.ltr(ltr_input, labels)
+        # hidden loss is a hack to prevent trainer to filter it out
+        return DenseOutput(loss=loss, hidden_loss=torch.full((1, 1), loss.item()),
+                           scores=scores, q_reps=q_reps, p_reps=p_reps)
 
 
 class ListNet(nn.Module):
@@ -80,15 +75,12 @@ class ListNet(nn.Module):
         )
         self.cross_entropy = nn.CrossEntropyLoss(reduction='mean')
 
-    def forward(self, x):
+    def forward(self, x, target):
         scores = self.layers(x).squeeze(-1)
 
         # ListNet Target.
         # Positive passages have top-one probability 1.
         # Negative passages have top-one probalility 0.
-        target = torch.zeros(x.size(0), x.size(1), device=device)
-        target[:, 0] = 1
-        target.to(device)
 
         loss = self.cross_entropy(scores, target)
         return scores, loss
@@ -107,7 +99,7 @@ class RankNet(nn.Module):
         )
         self.cross_entropy = nn.BCEWithLogitsLoss()
 
-    def forward(self, x):
+    def forward(self, x, target):
         scores = self.layers(x).squeeze(-1)
 
         # RankNet Target.
@@ -115,8 +107,6 @@ class RankNet(nn.Module):
         # if i > j, P_ij = 1
         # if i == j, P_ij = 0.5
         # if i < j, P_ij = 0
-        target = torch.zeros(x.size(0), x.size(1), device=device)
-        target.to(device)
         pairs_candidates = list(product(range(target.size(1)), repeat=2))
 
         pairs_target = target[:, pairs_candidates]
@@ -132,26 +122,6 @@ class RankNet(nn.Module):
         return scores, loss
 
 
-def MRR(scores):
-    """
-    scores: [batch_size, num_passages]
-    """
-    probs = F.softmax(scores, dim=1)
-    idx = torch.argmax(probs, axis=1) + 1
-    return torch.mean(1 / idx).item()
-
-
-def NDCG(scores):
-    """
-    scores: [batch_size, num_passages]
-    """
-    target = np.array([1] + [0] * (scores.size(1) - 1))
-    target = np.tile(target, (scores.size(0), 1))
-    probs = F.softmax(scores, dim=1)
-    probs = probs.detach().cpu().numpy()
-    return ndcg_score(target, probs)
-
-
 class DRCollactor(DataCollatorWithPadding):
     q_max_len: int = 32
     p_max_len: int = 128
@@ -159,6 +129,7 @@ class DRCollactor(DataCollatorWithPadding):
     def __call__(self, feature):
         queries = [x['query'] for x in feature]
         passages = [y for x in feature for y in x['passage']]
+        labels = torch.tensor([x['labels'] for x in feature], dtype=torch.float32)
         queries = self.tokenizer(
             queries,
             truncation=True,
@@ -173,11 +144,25 @@ class DRCollactor(DataCollatorWithPadding):
             padding=True,
             return_tensors="pt",
         )
-        return {'query': queries, 'passage': passages}
+        return {'query': queries, 'passage': passages, 'labels': labels}
+
+
+class Preprocessor:
+    def __init__(self, split):
+        self.split = split
+        self.split_map = {"train": 1, "dev": 2, "test": 3}
+
+    def __call__(self, data):
+        data['labels'] = [1] + [0] * (len(data['passage']) - 1)
+        data['split'] = self.split_map[self.split]
+        return data
 
 
 if __name__ == '__main__':
     dataset = load_dataset("json", data_files="sample_1000_abs.jsonl", split="train")
+    train_set = dataset.map(Preprocessor('train'))
+    dev_set = dataset.select(range(100)).map(Preprocessor('dev'))
+
     tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
     encoder = AutoModel.from_pretrained('Luyu/co-condenser-marco')
     collator = DRCollactor(tokenizer=tokenizer)
@@ -187,15 +172,26 @@ if __name__ == '__main__':
     training_args = TrainingArguments("model_output",
                                       learning_rate=5e-6,
                                       num_train_epochs=3,
-                                      per_device_train_batch_size=16)
-    trainer = Trainer(
-        model,
-        training_args,
-        train_dataset=dataset,
+                                      per_device_train_batch_size=16,
+                                      evaluation_strategy='steps',
+                                      eval_steps=1,
+                                      save_steps=100,
+                                      load_best_model_at_end=True,
+                                      metric_for_best_model="MMR",
+                                      remove_unused_columns=False)
+    trainer = DenseTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_set,
+        eval_dataset=dev_set,
         data_collator=collator,
         tokenizer=tokenizer,
+        compute_metrics=ComputeMetrics("dev", "model_metrics"),
+        compute_train_metric=ComputeMetrics("train", "model_metrics"),
     )
+
     trainer.train()
     trainer.save_model()
+
 
 
