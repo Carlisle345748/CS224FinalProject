@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 from torch import Tensor
-from transformers import AutoTokenizer, AutoModel, PreTrainedModel, DataCollatorWithPadding, TrainingArguments, Trainer
+from transformers import AutoTokenizer, AutoModel, PreTrainedModel, DataCollatorWithPadding, TrainingArguments
 from transformers.modeling_outputs import ModelOutput
+
 from metrics import ComputeMetrics
 from trainer import DenseTrainer
 
@@ -161,7 +162,7 @@ class Preprocessor:
 
 
 if __name__ == '__main__':
-    dataset = load_dataset("json", data_files="sample_1000_abs.jsonl", split="train")
+    dataset = load_dataset("json", data_files="Dataset/sample_1000_abs.jsonl", split="train")
     dataset = dataset.train_test_split(train_size=0.8, seed=42)
     train_set = dataset['train'].map(Preprocessor())
     dev_set = dataset['test'].map(Preprocessor())
