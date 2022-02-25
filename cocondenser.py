@@ -162,7 +162,7 @@ class Preprocessor:
 
 
 if __name__ == '__main__':
-    dataset = load_dataset("json", data_files="Dataset/sample_1000_abs.jsonl", split="train")
+    dataset = load_dataset("json", data_files="Dataset/sample_10000_abs.json", split="train")
     dataset = dataset.train_test_split(train_size=0.8, seed=42)
     train_set = dataset['train'].map(Preprocessor())
     dev_set = dataset['test'].map(Preprocessor())

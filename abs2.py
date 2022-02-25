@@ -1,150 +1,95 @@
-import random
-
 import numpy as np
 import pandas as pd
-import torch
 from datasets import load_from_disk
-from gensim.summarization.bm25 import BM25
-from torch.nn.functional import normalize
 from transformers import AutoTokenizer, AutoModel
-from multiprocessing import Pool
 
 
 class AdaptiveBatchSampling:
 	def __init__(self, dataset, similarity, encode=False):
 		self.encode = encode
-		self.data = [(x['query'], x['positives']) for x in dataset]
-		passage = list(set([x['positives'] for x in dataset]))
-		query = list(set([x['query'] for x in dataset]))
-		self.p2idx = {passage[i]: i for i in range(len(passage))}
-		self.q2idx = {query[i]: i for i in range(len(query))}
-		self.sim_cache = {}
-		self.sim_cache2 = similarity
+		self.data = dataset
+		self.sim_cache = similarity
+		np.fill_diagonal(self.sim_cache, 0)
 
 		if encode:
 			self.tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
 			self.model = AutoModel.from_pretrained('Luyu/co-condenser-marco')
-		else:
-			self.bm25 = BM25([doc.split(" ") for doc in passage])
-			self.avg_ifg = sum(float(val) for val in self.bm25.idf.values()) / len(self.bm25.idf)
-
-	def get_similarity(self, query_text, passage_text):
-		if query_text in self.sim_cache and passage_text in self.sim_cache[query_text]:
-			return self.sim_cache[query_text][passage_text]
-
-		if self.encode:
-			self.model.eval()
-			sequences = [query_text, passage_text]
-			model_inputs = self.tokenizer(sequences, padding=True, truncation=True, return_tensors="pt")
-			encoding = self.model(**model_inputs, return_dict=True).last_hidden_state[:, 0]
-			e1 = torch.nn.functional.normalize(encoding[0], p=2.0, dim=0)
-			e2 = torch.nn.functional.normalize(encoding[1], p=2.0, dim=0)
-			similarity = e1 @ e2
-
-		else:
-			query_tokens = query_text.split()
-			self.sim_cache[query_text] = {}
-			similarity = self.bm25.get_score(query_tokens, self.p2idx[passage_text])
-			self.sim_cache[query_text][passage_text] = similarity
-
-		return similarity
 
 	def get_hardness(self, hardness, dataset, d_remove=None, d_add=None):
 		if d_remove is None and d_add is None:
-			# for pair1 in temp:
-			# 	for pair2 in temp:
-			# 		if pair1 != pair2:
-			# 			hardness = hardness + self.get_similarity(pair1[0], pair2[1])
-			idx = np.tile(dataset, (len(dataset), 1))
-			hardness = np.take_along_axis(self.sim_cache2[dataset, :], idx, axis=1).sum()
-		elif d_remove is not None and d_add is not None:
-			for pair in dataset:
-				if pair != d_remove:
-					hardness = hardness - self.get_similarity(pair[0], d_remove[1]) - \
-					           self.get_similarity(d_remove[0], pair[1]) + \
-					           self.get_similarity(pair[0], d_add[1]) + \
-					           self.get_similarity(d_add[0], pair[1])
-
+			hardness = self.subarray(dataset, dataset).sum()
 		elif d_remove is not None and d_add is None:
-			for pair in dataset:
-				if pair != d_remove:
-					hardness = hardness - self.get_similarity(pair[0], d_remove[1]) - \
-					           self.get_similarity(d_remove[0], pair[1])
-
+			hardness -= self.sim_cache[d_remove, dataset].sum()
+			hardness -= self.sim_cache[dataset, d_remove].sum()
 		elif d_remove is None and d_add is not None:
-			h_copy = hardness
-			for pair in dataset:
-				hardness = hardness + self.get_similarity(pair[0], d_add[1]) + self.get_similarity(d_add[0], pair[1])
-			# h_copy +=
-
+			hardness += self.sim_cache[d_add, dataset].sum()
+			hardness += self.sim_cache[dataset, d_add].sum()
+		elif d_remove is not None and d_add is not None:
+			hardness -= self.sim_cache[d_remove, dataset].sum()
+			hardness -= self.sim_cache[dataset, d_remove].sum()
+			dataset = np.setdiff1d(dataset, d_remove)
+			hardness += self.sim_cache[d_add, dataset].sum()
+			hardness += self.sim_cache[dataset, d_add].sum()
 		return hardness
 
-	def get_remove(self, dataset, hardness):
-		max_hardness = float("-inf")
-		temp = dataset.copy()
-		pair_remove = ()
-
-		for pair in dataset:
-			temp_hardness = self.get_hardness(hardness, temp, pair, None)
-			if temp_hardness > max_hardness:
-				max_hardness = temp_hardness
-				pair_remove = pair
-
+	def get_remove(self, dataset):
+		sub_arr = self.subarray(dataset, dataset)
+		diff = np.sum(sub_arr, axis=1)
+		np.add(diff, np.sum(sub_arr, axis=0), out=diff)
+		pair_remove = dataset[np.argmin(diff)]
 		return pair_remove
 
-	def get_add(self, current_dataset, pair_remove, remain_dataset, hardness):
-		temp = current_dataset.copy()
-		remain = remain_dataset.copy()
-		remain = remain - set(temp)
-		cur_hardness = self.get_hardness(hardness, temp, pair_remove, None)
-		temp.remove(pair_remove)
-		pair_add = ()
-		max_hardness = float("-inf")
+	def subarray(self, row, col):
+		# prevent create huge array in self.sim_cache[:, col] or self.sim_cache[row, :]
+		if len(row) > len(col):
+			return np.take(self.sim_cache[:, col], row, axis=0)
+		else:
+			return np.take(self.sim_cache[row, :], col, axis=1)
 
-		for pair in remain:
-			temp_hardness = self.get_hardness(cur_hardness, temp, None, pair)
-			if temp_hardness > max_hardness:
-				max_hardness = temp_hardness
-				pair_add = pair
-
+	def get_add(self, current_dataset, pair_remove, remain_dataset):
+		remain = np.setdiff1d(remain_dataset, current_dataset)
+		temp = np.setdiff1d(current_dataset, pair_remove)
+		diff = np.sum(self.subarray(remain, temp), axis=1)
+		np.add(diff, np.sum(self.subarray(temp, remain), axis=0), out=diff)
+		pair_add = remain[np.argmax(diff)]
 		return pair_add
 
-	@staticmethod
-	def reformat(dataset):
+	def reformat(self, dataset):
 		B = []
-		for pair1 in dataset:
-			query = pair1[0]
-			current_row = []
-			for pair2 in dataset:
-				if pair2[0] != query:
-					current_row.append(pair2[1])
-			current_row = [pair1[1]] + current_row
-			B.append([query, current_row])
+		for q in dataset:
+			q = int(q)
+			query_text = self.data[q]['query']
+			passages = []
+			for p in dataset:
+				p = int(p)
+				if p != q:
+					passages.append(self.data[p]['positives'])
+			passages = [self.data[q]['positives']] + passages
+			B.append([query_text, passages])
 		return B
 
 	def solve(self, batch_size, output_file=None):
-		np.random.seed(12)
-		U = np.arange(len(self.data))
+		U = np.arange(len(self.data), dtype=np.int32)
 		T = []
 		while U.shape[0] > 0:
 			B = U[np.random.randint(low=0, high=len(U), size=batch_size)]
 			if U.shape[0] > batch_size:
 				hardness_B = self.get_hardness(0, B)
 				while True:
-					d_r = self.get_remove(B, hardness_B)
-					d_a = self.get_add(B, d_r, U, hardness_B)
+					d_r = self.get_remove(B)
+					d_a = self.get_add(B, d_r, U)
 					hardness_B_tem = self.get_hardness(hardness_B, B, d_r, d_a)
 					if hardness_B_tem > hardness_B:
-						B.remove(d_r)
-						B.append(d_a)
+						B = np.setdiff1d(B, d_r)
+						B = np.append(B, d_a)
 						hardness_B = hardness_B_tem
 					else:
 						break
 
-			print(B)
-			B = set(B)
-			U = U - B
-			T.extend(self.reformat(B))
+			U = np.setdiff1d(U, B)
+			batch = self.reformat(B)
+			print(batch)
+			T.extend(batch)
 
 		if output_file:
 			df = pd.DataFrame.from_records(T)
@@ -154,24 +99,9 @@ class AdaptiveBatchSampling:
 		return T
 
 
-# samples = load_from_disk("Dataset/sample_1000_raw")
-# passage = [x['positives'] for x in samples]
-# bm25 = BM25([doc.split(" ") for doc in passage])
-# query = list(set([x['query'] for x in samples]))
-
-
-# def process(x):
-# 	print(x)
-# 	return np.array(bm25.get_scores(x.split(" ")))
-
-
 if __name__ == '__main__':
-	sim = np.load("sim_1000.npy")
-	samples = load_from_disk("Dataset/sample_1000_raw")
+	sim = np.load("Similarity/sim_1000.npz")['arr_0']
+	n = np.count_nonzero(sim)
+	samples = load_from_disk("Dataset/sample_50000_raw")
 	ABS = AdaptiveBatchSampling(samples, encode=False, similarity=sim)
-	batches = ABS.solve(8, output_file="sample_1000_abs.json")
-	# with Pool() as p:
-	# 	sims = p.map(process, query)
-	# 	arr = np.vstack(sims)
-	# 	np.save("sim_1000.npy", arr)
-
+	batches = ABS.solve(8, output_file="Dataset/sample_1000_abs.json")
