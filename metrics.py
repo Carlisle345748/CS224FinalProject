@@ -9,10 +9,12 @@ from sklearn.metrics import ndcg_score
 
 
 class ComputeMetrics:
-    def __init__(self, split, output_dir):
+    def __init__(self, split, output_dir, save_step=1, verbose=False):
         self.split = split
         self.output_dir = output_dir
         self.counter = 0
+        self.save_step = save_step
+        self.verbose = verbose
         self.filename = f"{self.split}_metrics_{datetime.now().strftime('%Y%m%d%H%M%S')}.jsonl"
 
     def __call__(self, eval_preds):
@@ -21,7 +23,8 @@ class ComputeMetrics:
         mmr = self.MRR(scores, labels)
         ndcg = self.NDCG(scores, labels)
         metrics = {'loss': loss, 'mmr': mmr, "ndcg": ndcg}
-        print(f'{self.split} step{self.counter+1}: loss={loss} mmr={mmr} ndcg={ndcg}')
+        if self.verbose:
+            print(f'{self.split} step{self.counter+1}: loss={loss} mmr={mmr} ndcg={ndcg}')
         self.save_metrics(metrics)
         return metrics
 
@@ -58,8 +61,11 @@ class ComputeMetrics:
         difference is that raw unformatted numbers are saved in the current method.
 
         """
-        metrics = metrics.copy()
         self.counter += 1
+        if self.counter % self.save_step != 0:
+            return
+
+        metrics = metrics.copy()
         metrics['step'] = self.counter
 
         if not os.path.exists(self.output_dir):

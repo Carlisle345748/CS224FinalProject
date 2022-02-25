@@ -175,11 +175,11 @@ if __name__ == '__main__':
 
     training_args = TrainingArguments("model_output",
                                       learning_rate=5e-6,
-                                      num_train_epochs=30,
+                                      num_train_epochs=10,
                                       per_device_train_batch_size=16,
                                       evaluation_strategy='steps',
                                       eval_steps=100,
-                                      save_steps=100,
+                                      save_steps=500,
                                       load_best_model_at_end=True,
                                       metric_for_best_model="mmr",
                                       remove_unused_columns=False)
@@ -191,7 +191,7 @@ if __name__ == '__main__':
         data_collator=collator,
         tokenizer=tokenizer,
         compute_metrics=ComputeMetrics("dev", "model_metrics"),
-        compute_train_metric=ComputeMetrics("train", "model_metrics"),
+        compute_train_metric=ComputeMetrics("train", "model_metrics", save_step=100),
     )
 
     trainer.train()
