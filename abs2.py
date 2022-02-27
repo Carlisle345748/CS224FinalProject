@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from datasets import load_from_disk
 from transformers import AutoTokenizer, AutoModel
+from tqdm import tqdm
 
 
 class AdaptiveBatchSampling:
@@ -36,8 +37,9 @@ class AdaptiveBatchSampling:
 		sub_arr = self.subarray(dataset, dataset)
 		diff = np.sum(sub_arr, axis=1)
 		np.add(diff, np.sum(sub_arr, axis=0), out=diff)
-		pair_remove = dataset[np.argmin(diff)]
-		return pair_remove
+		min_idx = np.argmin(diff)
+		pair_remove, sub = dataset[min_idx], diff[min_idx]
+		return pair_remove, sub
 
 	def subarray(self, row, col):
 		# prevent create huge array in self.sim_cache[:, col] or self.sim_cache[row, :]
@@ -51,8 +53,9 @@ class AdaptiveBatchSampling:
 		temp = np.setdiff1d(current_dataset, pair_remove)
 		diff = np.sum(self.subarray(remain, temp), axis=1)
 		np.add(diff, np.sum(self.subarray(temp, remain), axis=0), out=diff)
-		pair_add = remain[np.argmax(diff)]
-		return pair_add
+		max_idx = np.argmax(diff)
+		pair_add, add = remain[np.argmax(diff)], diff[max_idx]
+		return pair_add, add
 
 	def reformat(self, dataset):
 		B = []
@@ -69,6 +72,7 @@ class AdaptiveBatchSampling:
 		return B
 
 	def solve(self, batch_size, output_file=None):
+		t = tqdm(total=len(self.data))
 		U = np.arange(len(self.data), dtype=np.int32)
 		T = []
 		while U.shape[0] > 0:
@@ -76,9 +80,9 @@ class AdaptiveBatchSampling:
 			if U.shape[0] > batch_size:
 				hardness_B = self.get_hardness(0, B)
 				while True:
-					d_r = self.get_remove(B)
-					d_a = self.get_add(B, d_r, U)
-					hardness_B_tem = self.get_hardness(hardness_B, B, d_r, d_a)
+					d_r, sub = self.get_remove(B)
+					d_a, add = self.get_add(B, d_r, U)
+					hardness_B_tem = hardness_B - sub + add
 					if hardness_B_tem > hardness_B:
 						B = np.setdiff1d(B, d_r)
 						B = np.append(B, d_a)
@@ -88,8 +92,8 @@ class AdaptiveBatchSampling:
 
 			U = np.setdiff1d(U, B)
 			batch = self.reformat(B)
-			print(batch)
 			T.extend(batch)
+			t.update(len(batch))
 
 		if output_file:
 			df = pd.DataFrame.from_records(T)
@@ -100,8 +104,7 @@ class AdaptiveBatchSampling:
 
 
 if __name__ == '__main__':
-	sim = np.load("Similarity/sim_1000.npz")['arr_0']
-	n = np.count_nonzero(sim)
+	sim = np.memmap("Dataset/sim_50000.dat", dtype=np.float16, mode='r+', shape=(50000, 50000))
 	samples = load_from_disk("Dataset/sample_50000_raw")
 	ABS = AdaptiveBatchSampling(samples, encode=False, similarity=sim)
-	batches = ABS.solve(8, output_file="Dataset/sample_1000_abs.json")
+	batches = ABS.solve(8, output_file="Dataset/sample_50000_abs.json")

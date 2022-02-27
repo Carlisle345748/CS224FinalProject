@@ -135,6 +135,7 @@ class AdaptiveBatchSampling:
 						B.append(d_a)
 						hardness_B = hardness_B_tem
 					else:
+						print(hardness_B)
 						break
 
 			print(B)
@@ -154,4 +155,4 @@ class AdaptiveBatchSampling:
 if __name__ == '__main__':
 	samples = load_from_disk("Dataset/sample_1000_raw")
 	ABS = AdaptiveBatchSampling(samples, encode=False)
-	batches = ABS.solve(8, output_file="Dataset/sample_1000_abs.json")
+	batches = ABS.solve(8)

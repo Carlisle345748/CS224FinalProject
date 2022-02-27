@@ -174,10 +174,13 @@ if __name__ == '__main__':
     model = CondenserLTR(q_enc=encoder, p_enc=encoder, ltr=LTR, psg_per_qry=8)
 
     training_args = TrainingArguments("model_output",
+                                      overwrite_output_dir=True,
                                       learning_rate=5e-6,
                                       num_train_epochs=10,
                                       per_device_train_batch_size=16,
                                       evaluation_strategy='steps',
+                                      save_strategy="steps",
+                                      save_total_limit=10,
                                       eval_steps=100,
                                       save_steps=500,
                                       load_best_model_at_end=True,
