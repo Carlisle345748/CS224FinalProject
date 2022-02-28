@@ -76,8 +76,8 @@ class AdaptiveBatchSampling:
 	@staticmethod
 	def get_remove(cache):
 		sim_arr = cache.get()
-		diff = np.sum(sim_arr, axis=1) + np.sum(sim_arr, axis=0)
-		min_idx = np.argmin(diff)
+		diff = torch.sum(sim_arr, dim=1) + torch.sum(sim_arr, dim=0)
+		min_idx = torch.argmin(diff)
 		pair_remove, sub = cache.qid[min_idx], diff[min_idx]
 		return pair_remove, sub
 
@@ -94,7 +94,7 @@ class AdaptiveBatchSampling:
 		s2[idx] = -np.inf
 
 		diff = s1 + s2
-		max_idx = np.argmax(diff)
+		max_idx = torch.argmax(diff)
 		pair_add, add = remain_dataset[max_idx], diff[max_idx]
 
 		return pair_add, add

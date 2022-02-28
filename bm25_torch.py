@@ -92,21 +92,20 @@ class BM25(object):
         return scores
 
     def batch_get_score(self, queries, indexes, encoded=False):
-        numerator_constant = self.k1 + 1
+        numerator_constant = torch.tensor(self.k1 + 1, dtype=torch.float16)
         if not encoded:
             queries = self.batch_encode(queries).to(self.device)
         denominator_constant = self.denominator_constant[indexes].reshape(-1, 1, 1)
 
         df = torch.zeros(len(indexes), queries.size(0), queries.size(1), device=self.device)
-        idf = torch.zeros(1, queries.size(0), queries.size(1), device=self.device)
+        idf = self.idf[queries]
 
-        for i in range(queries.size(0)):
-            if len(queries) >= len(indexes):
-                df[:, i, :] = torch.index_select(self.doc_freqs[indexes], index=queries[i], dim=1)
-            else:
+        if len(queries) <= len(indexes):
+            for i in range(len(queries)):
                 df[:, i, :] = torch.index_select(self.doc_freqs, index=queries[i], dim=1)[indexes]
-
-            idf[0, i, :] = torch.index_select(self.idf, index=queries[i], dim=0)
+        else:
+            for i in range(len(indexes)):
+                df[i] = self.doc_freqs[indexes[i]][queries]
 
         n = df * idf * numerator_constant
         d = df + denominator_constant
@@ -123,15 +122,15 @@ class BM25(object):
 
 
 if __name__ == '__main__':
-    samples = load_from_disk("Dataset/sample_50000_raw")
+    samples = load_from_disk("Dataset/sample_1000_raw")
     tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
     bm25 = BM25(corpus=samples['positives'], tokenizer=tokenizer)
     text = "His mother, Bl. Joan of Aza, was a holy woman in her own right."
-    s1 = bm25.get_score(text, 150)
-    s2 = bm25.get_score("His mother, Bl. Joan of Aza, was a holy woman in her own right.", 160)
+    text1 = "His mother, Bl. Joan of Aza"
+    s2 = bm25.get_score(text, 160)
     s3 = bm25.get_scores("His mother, Bl. Joan of Aza, was a holy woman in her own right.")
-    s4 = bm25.get_score("His mother, Bl. Joan of Aza", 150)
-    s5 = bm25.get_score("His mother, Bl. Joan of Aza", 160)
-    s6 = bm25.batch_get_score(["His mother, Bl. Joan of Aza, was a holy woman in her own right"] * 8, [1,2,3])
+    s4 = bm25.get_score(text1, 150)
+    s5 = bm25.get_score(text1, 160)
+    s6 = bm25.batch_get_score([text, text1, text1], [150, 160])
     print(1)
 
