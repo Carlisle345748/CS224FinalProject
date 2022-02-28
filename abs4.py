@@ -1,3 +1,5 @@
+import os.path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -177,31 +179,50 @@ class AdaptiveBatchSampling:
 
 		return pair_add, add
 
-	def reformat(self, dataset):
-		B = []
-		for q in dataset:
-			q = int(q)
-			query_text = self.dataset[q]['query']
-			passages = []
-			for p in dataset:
-				p = int(p)
-				if p != q:
-					passages.append(self.dataset[p]['positives'])
-			passages = [self.dataset[q]['positives']] + passages
-			B.append([query_text, passages])
-		return B
+	def save_result(self, T, output_file):
+		result = []
+		for batch in T:
+			for qid in batch:
+				qid = int(qid)
+				query_text = self.dataset[qid]['query']
+				passages = []
+				for pid in batch:
+					pid = int(pid)
+					if pid != qid:
+						passages.append(self.dataset[pid]['positives'])
+				passages = [self.dataset[qid]['positives']] + passages
+				result.append([query_text, passages])
+		df = pd.DataFrame.from_records(result)
+		df.columns = ['query', 'passage']
+		df.to_json(output_file, orient="records", lines=True)
 
-	def solve(self, batch_size, output_file=None):
-		t = tqdm(total=len(self.query))
-		U = np.arange(len(self.query), dtype=np.int32)
-		T = []
-		while U.shape[0] > 0:
-			B = U[np.random.randint(low=0, high=len(U), size=batch_size)]
+	def solve(self, batch_size, output_dir=None, checkpoint_step=500, resume_from_checkpoint=None):
+		if output_dir:
+			os.makedirs(output_dir, exist_ok=True)
+
+		total = len(self.query) // batch_size * batch_size
+		progress = tqdm(total=total)
+
+		if resume_from_checkpoint is not None:
+			U = np.load(os.path.join(resume_from_checkpoint, "U.npy"))
+			T = np.load(os.path.join(resume_from_checkpoint, "T.npy"))
+			T = [x for x in T]
+			hardness_log = np.loadtxt(os.path.join(resume_from_checkpoint, "hardness.txt")).tolist()
+			progress.update(len(T)*batch_size)
+			last_save_step = len(T)*batch_size
+		else:
+			hardness_log = []
+			last_save_step = 0
+			U = np.arange(len(self.query), dtype=np.int32)
+			T = []
+
+		while U.shape[0] >= batch_size:
+			B = np.random.choice(U, size=batch_size, replace=False)
+			cache_B = SimilarityCache(self.sim, self.dup_set, B, B)
+			hardness_B = cache_B.get().sum()
 			if U.shape[0] > batch_size:
-				cache_B = SimilarityCache(self.sim, self.dup_set, B, B)
 				cache_B_U = SimilarityCache(self.sim, self.dup_set, B, U)
 				cache_U_B = SimilarityCache(self.sim, self.dup_set, U, B)
-				hardness_B = cache_B.get().sum()
 				while True:
 					d_r, sub = self.get_remove(cache_B)
 					d_a, add = self.get_add(B, d_r, U, cache_b_u=cache_B_U, cache_u_b=cache_U_B)
@@ -215,18 +236,25 @@ class AdaptiveBatchSampling:
 						cache_B_U.swap_query(d_r, d_a)
 						cache_U_B.swap_passage(d_r, d_a)
 					else:
-						print(hardness_B.item())
 						break
 
 			U = np.setdiff1d(U, B)
-			batch = self.reformat(B)
-			T.extend(batch)
-			t.update(len(batch))
+			T.append(B)
+			hardness_log.append(hardness_B.item())
+			progress.update(batch_size)
+			if output_dir is not None and len(T) * batch_size - last_save_step >= checkpoint_step and len(U) != 0:
+				checkpoint_dir = os.path.join(output_dir, f'checkpoint_{len(T) * batch_size}')
+				os.makedirs(checkpoint_dir, exist_ok=True)
+				np.save(os.path.join(checkpoint_dir, "U.npy"), U)
+				np.save(os.path.join(checkpoint_dir, "T.npy"), np.vstack(T))
+				np.savetxt(os.path.join(checkpoint_dir, "hardness.txt"), np.array(hardness_log))
+				last_save_step = len(T) * batch_size
 
-		if output_file:
-			df = pd.DataFrame.from_records(T)
-			df.columns = ['query', 'passage']
-			df.to_json(output_file, orient="records", lines=True)
+		if output_dir:
+			output_file = os.path.join(output_dir, "abs.json")
+			hardness_file = os.path.join(output_dir, "hardness.txt")
+			np.savetxt(hardness_file, np.array(hardness_log))
+			self.save_result(T, output_file)
 
 		return T
 
@@ -239,4 +267,4 @@ if __name__ == '__main__':
 	similarity = Similarity(q_enc=q_enc, p_enc=p_enc, tokenizer=tokenizer,
 	                        dataset=samples, cache_file="Dataset/sim_cache_1000.npz")
 	ABS = AdaptiveBatchSampling(samples, tokenizer=tokenizer, sim=similarity)
-	batches = ABS.solve(8)
+	batches = ABS.solve(8, output_dir="abs_output", resume_from_checkpoint="abs_output/checkpoint_504")

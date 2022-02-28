@@ -53,7 +53,7 @@ class CondenserLTR(nn.Module):
         # Prepare LTR model input
         batch_size = q_reps.size(0)
         q_idx_map = sum(map(lambda x: [x] * self.psg_per_qry, range(batch_size)), [])
-        ltr_input = torch.cat([p_reps, q_reps[q_idx_map]], axis=1)
+        ltr_input = torch.cat([p_reps, q_reps[q_idx_map]], dim=1)
         ltr_input = ltr_input.view(batch_size, -1, q_reps.size(1) + p_reps.size(1))
 
         # Run LTR model
