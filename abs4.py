@@ -54,8 +54,9 @@ class Similarity:
 
 
 class SimilarityCache:
-	def __init__(self, sim: Similarity, qid, pid):
+	def __init__(self, sim: Similarity, dup_set, qid, pid):
 		self.sim = sim
+		self.dup_set = dup_set
 		self.qid = qid
 		self.pid = pid
 		self.qid2rowid = {qid[i]: i for i in range(len(qid))}
@@ -63,21 +64,38 @@ class SimilarityCache:
 		self.cache = sim.get_sim(qid, pid)
 
 		if len(qid) <= len(pid):
-			for i in self.qid:
-				if i in self.pid2colid:
-					self.cache[self.qid2rowid[i], self.pid2colid[i]] = 0
+			for _id in self.qid:
+				# Set S_ii = 0
+				if _id in self.pid2colid:
+					self.cache[self.qid2rowid[_id], self.pid2colid[_id]] = 0
+				# If a passage is answer to multiple queries, it should not be considered as negative sample
+				if _id in self.dup_set:
+					for dup_id in self.dup_set[_id]:
+						if dup_id in self.pid2colid:
+							self.cache[self.qid2rowid[_id], self.pid2colid[dup_id]] = 0
 		else:
-			for i in self.pid:
-				if i in self.qid2rowid:
-					self.cache[self.qid2rowid[i], self.pid2colid[i]] = 0
+			for _id in self.pid:
+				# Set S_ii = 0
+				if _id in self.qid2rowid:
+					self.cache[self.qid2rowid[_id], self.pid2colid[_id]] = 0
+				# If a passage is answer to multiple queries, it should not be considered as negative sample
+				if _id in self.dup_set:
+					for dup_id in self.dup_set[_id]:
+						if dup_id in self.qid2rowid:
+							self.cache[self.qid2rowid[dup_id], self.pid2colid[_id]] = 0
 
 	def get(self):
 		return self.cache
 
 	def swap_query(self, old_qid, new_qid):
 		new_score = self.sim.get_sim([new_qid], self.pid)
-		if new_qid in self.pid:
+		if new_qid in self.pid2colid:
 			new_score[0, self.pid2colid[new_qid]] = 0
+		if new_qid in self.dup_set:
+			for dup_id in self.dup_set[new_qid]:
+				if dup_id in self.pid2colid:
+					new_score[0, self.pid2colid[dup_id]] = 0
+
 		row_idx = self.qid2rowid[old_qid]
 		self.cache[row_idx] = new_score
 		self.qid[row_idx] = new_qid
@@ -88,6 +106,11 @@ class SimilarityCache:
 		new_score = self.sim.get_sim(self.qid, [new_pid]).flatten()
 		if new_pid in self.qid2rowid:
 			new_score[self.qid2rowid[new_pid]] = 0
+		if new_pid in self.dup_set:
+			for dup_id in self.dup_set[new_pid]:
+				if dup_id in self.qid2rowid:
+					new_score[self.qid2rowid[dup_id]] = 0
+
 		col_idx = self.pid2colid[old_pid]
 		self.cache[:, col_idx] = new_score
 		self.pid[col_idx] = new_pid
@@ -105,11 +128,28 @@ class AdaptiveBatchSampling:
 	def __init__(self, dataset: Dataset, tokenizer: PreTrainedTokenizer, sim: Similarity):
 		self.dataset = dataset
 		self.tokenizer = tokenizer
+		self.sim = sim
 		self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-		self.query = self.tokenizer([x['query'] for x in dataset], return_tensors="pt", padding='max_length',
+		self.query = self.tokenizer(dataset['query'], return_tensors="pt", padding='max_length',
 		                            return_attention_mask=False, add_special_tokens=False, truncation=True,
 		                            return_token_type_ids=False).input_ids.to(self.device)
-		self.sim = sim
+
+		# Find passages that are answers to multiple questions
+		dup_p = {}
+		passage_set = {}
+		for i in range(len(dataset)):
+			passage = dataset[i]['positives']
+			if passage in passage_set:
+				passage_set[passage].add(i)
+				if len(passage_set[passage]) > 1:
+					dup_p[passage] = passage_set[passage]
+			else:
+				passage_set[passage] = {i}
+
+		self.dup_set = {}
+		for dup_set in dup_p.values():
+			for idx in dup_set:
+				self.dup_set[idx] = dup_set - {idx}
 
 	@staticmethod
 	def get_remove(cache):
@@ -158,9 +198,9 @@ class AdaptiveBatchSampling:
 		while U.shape[0] > 0:
 			B = U[np.random.randint(low=0, high=len(U), size=batch_size)]
 			if U.shape[0] > batch_size:
-				cache_B = SimilarityCache(self.sim, B, B)
-				cache_B_U = SimilarityCache(self.sim, B, U)
-				cache_U_B = SimilarityCache(self.sim, U, B)
+				cache_B = SimilarityCache(self.sim, self.dup_set, B, B)
+				cache_B_U = SimilarityCache(self.sim, self.dup_set, B, U)
+				cache_U_B = SimilarityCache(self.sim, self.dup_set, U, B)
 				hardness_B = cache_B.get().sum()
 				while True:
 					d_r, sub = self.get_remove(cache_B)
