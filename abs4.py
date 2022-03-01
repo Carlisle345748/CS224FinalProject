@@ -1,4 +1,4 @@
-import os.path
+import os
 
 import numpy as np
 import pandas as pd
@@ -127,14 +127,10 @@ class SimilarityCache:
 
 
 class AdaptiveBatchSampling:
-	def __init__(self, dataset: Dataset, tokenizer: PreTrainedTokenizer, sim: Similarity):
+	def __init__(self, dataset: Dataset, sim: Similarity):
 		self.dataset = dataset
-		self.tokenizer = tokenizer
 		self.sim = sim
 		self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-		self.query = self.tokenizer(dataset['query'], return_tensors="pt", padding='max_length',
-		                            return_attention_mask=False, add_special_tokens=False, truncation=True,
-		                            return_token_type_ids=False).input_ids.to(self.device)
 
 		# Find passages that are answers to multiple questions
 		dup_p = {}
@@ -200,7 +196,7 @@ class AdaptiveBatchSampling:
 		if output_dir:
 			os.makedirs(output_dir, exist_ok=True)
 
-		total = len(self.query) // batch_size * batch_size
+		total = len(self.dataset) // batch_size * batch_size
 		progress = tqdm(total=total)
 
 		if resume_from_checkpoint is not None:
@@ -213,7 +209,7 @@ class AdaptiveBatchSampling:
 		else:
 			hardness_log = []
 			last_save_step = 0
-			U = np.arange(len(self.query), dtype=np.int32)
+			U = np.arange(len(self.dataset), dtype=np.int32)
 			T = []
 
 		while U.shape[0] >= batch_size:
@@ -266,5 +262,5 @@ if __name__ == '__main__':
 	p_enc = AutoModel.from_pretrained('Luyu/co-condenser-marco')
 	similarity = Similarity(q_enc=q_enc, p_enc=p_enc, tokenizer=tokenizer,
 	                        dataset=samples, cache_file="Dataset/sim_cache_1000.npz")
-	ABS = AdaptiveBatchSampling(samples, tokenizer=tokenizer, sim=similarity)
-	batches = ABS.solve(8, output_dir="abs_output", resume_from_checkpoint="abs_output/checkpoint_504")
+	ABS = AdaptiveBatchSampling(samples, sim=similarity)
+	batches = ABS.solve(8, output_dir="abs_output")
