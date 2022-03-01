@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 from datasets import load_from_disk, Dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel, PreTrainedModel, PreTrainedTokenizer
+from transformers import AutoTokenizer, AutoModel, PreTrainedModel
 
 
 class Similarity:
@@ -177,17 +177,19 @@ class AdaptiveBatchSampling:
 
 	def save_result(self, T, output_file):
 		result = []
+		queries = self.dataset['query']
+		passages = self.dataset['positives']
 		for batch in T:
 			for qid in batch:
 				qid = int(qid)
-				query_text = self.dataset[qid]['query']
-				passages = []
+				qry = queries[qid]
+				psg = []
 				for pid in batch:
 					pid = int(pid)
 					if pid != qid:
-						passages.append(self.dataset[pid]['positives'])
-				passages = [self.dataset[qid]['positives']] + passages
-				result.append([query_text, passages])
+						psg.append(passages[pid])
+				psg = [passages[qid]] + psg
+				result.append([qry, psg])
 		df = pd.DataFrame.from_records(result)
 		df.columns = ['query', 'passage']
 		df.to_json(output_file, orient="records", lines=True)

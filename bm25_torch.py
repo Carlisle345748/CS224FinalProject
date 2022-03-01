@@ -28,6 +28,8 @@ class BM25(object):
         self.doc_freqs = torch.tensor(self.doc_freqs, dtype=torch.uint8, device=self.device)
         self.idf = torch.tensor(self.idf, device=self.device)
         self.denominator_constant = torch.tensor(self.denominator_constant, device=self.device)
+        self.denominator_constant2 = self.denominator_constant.reshape(-1, 1, 1)
+        self.numerator_constant = torch.tensor(self.k1 + 1, dtype=torch.float16)
 
     def _initialize(self, corpus):
         """Calculates frequencies of terms in documents and in corpus. Also computes inverse document frequencies."""
@@ -71,43 +73,40 @@ class BM25(object):
         self.denominator_constant = self.k1 * (1 - self.b + self.b * self.doc_len / self.avgdl)
 
     def get_score(self, query, index, encoded=False):
-        numerator_constant = self.k1 + 1
         denominator_constant = self.denominator_constant[index]
         if not encoded:
             query = self.encode(query).to(self.device)
 
         df = self.doc_freqs[index, query]
         idf = self.idf[query]
-        score = torch.sum(idf * df * numerator_constant / (df + denominator_constant))
+        score = torch.sum(idf * df * self.numerator_constant / (df + denominator_constant))
         return score
 
     def get_scores(self, query, encoded=False):
-        numerator_constant = self.k1 + 1
         if not encoded:
             query = self.encode(query).to(self.device)
 
         df = self.doc_freqs[:, query]
         idf = self.idf[query]
-        scores = torch.sum(idf * df * numerator_constant / (df + self.denominator_constant.reshape(-1, 1)), dim=1)
+        scores = torch.sum(idf * df * self.numerator_constant / (df + self.denominator_constant.reshape(-1, 1)), dim=1)
         return scores
 
     def batch_get_score(self, queries, indexes, encoded=False):
-        numerator_constant = torch.tensor(self.k1 + 1, dtype=torch.float16)
         if not encoded:
             queries = self.batch_encode(queries).to(self.device)
-        denominator_constant = self.denominator_constant[indexes].reshape(-1, 1, 1)
+        denominator_constant = self.denominator_constant2[indexes]
 
         df = torch.zeros(len(indexes), queries.size(0), queries.size(1), device=self.device)
         idf = self.idf[queries]
 
         if len(queries) <= len(indexes):
             for i in range(len(queries)):
-                df[:, i, :] = torch.index_select(self.doc_freqs, index=queries[i], dim=1)[indexes]
+                df[:, i, :] = self.doc_freqs[:, queries[i]][indexes]
         else:
             for i in range(len(indexes)):
                 df[i] = self.doc_freqs[indexes[i]][queries]
 
-        n = df * idf * numerator_constant
+        n = df * idf * self.numerator_constant
         d = df + denominator_constant
         score = torch.sum(n / d, dim=-1).T
         return score
@@ -131,6 +130,6 @@ if __name__ == '__main__':
     s3 = bm25.get_scores("His mother, Bl. Joan of Aza, was a holy woman in her own right.")
     s4 = bm25.get_score(text1, 150)
     s5 = bm25.get_score(text1, 160)
-    s6 = bm25.batch_get_score([text, text1, text1], [150, 160])
+    s6 = bm25.batch_get_score([text, text1], [150, 160, 170])
     print(1)
 
