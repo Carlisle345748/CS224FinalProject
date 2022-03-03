@@ -34,7 +34,7 @@ class ComputeMetrics:
         scores: [batch_size, num_passages]
         """
         probs = softmax(scores, axis=1)
-        rank = rankdata(-probs, axis=1)
+        rank = np.apply_along_axis(rankdata, axis=1, arr=-probs)
         idx = np.argmax(target, axis=1).reshape(-1, 1)
         rank_top_idx = np.take_along_axis(rank, idx, axis=1)  # The rank of the top 1 item of target in prediction
         return np.mean(1 / rank_top_idx)
@@ -48,19 +48,6 @@ class ComputeMetrics:
         return ndcg_score(target, probs)
 
     def save_metrics(self, metrics):
-        """
-        Save metrics into a json file for that split, e.g. ``train_results.json``.
-
-        Args:
-            split (:obj:`str`):
-                Mode/split name: one of ``train``, ``eval``, ``test``, ``all``
-            metrics (:obj:`Dict[str, float]`):
-                The metrics returned from train/evaluate/predict
-
-        To understand the metrics please read the docstring of :meth:`~transformers.Trainer.log_metrics`. The only
-        difference is that raw unformatted numbers are saved in the current method.
-
-        """
         self.counter += 1
         if self.counter % self.save_step != 0:
             return
