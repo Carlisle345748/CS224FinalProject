@@ -9,17 +9,23 @@ from transformers import AutoTokenizer, AutoModel, PreTrainedModel
 
 
 class Similarity:
-	def __init__(self, q_enc: PreTrainedModel, p_enc: PreTrainedModel, tokenizer, dataset, cache_file=None):
+	def __init__(self,
+	             q_enc: PreTrainedModel = None,
+	             p_enc: PreTrainedModel = None,
+	             tokenizer=None,
+	             dataset=None,
+	             cache_file=None):
+
 		self.dataset = dataset
 		self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-		self.q_enc = q_enc.to(self.device)
-		self.p_enc = p_enc.to(self.device)
+		self.q_enc = q_enc.to(self.device) if q_enc else None
+		self.p_enc = p_enc.to(self.device) if p_enc else None
 		self.tokenizer = tokenizer
 
 		if cache_file is not None:
 			cache = np.load(cache_file)
 			self.query = torch.from_numpy(cache['query']).to(self.device)
-			self.passage = torch.from_numpy(cache['passage']).to(self.device)
+			self.passage = torch.from_numpy(cache['passage']).T.to(self.device)
 		else:
 			self.query = torch.zeros(len(dataset), 768, dtype=torch.float32).to(self.device)
 			self.passage = torch.zeros(768, len(dataset), dtype=torch.float32).to(self.device)
@@ -30,14 +36,16 @@ class Similarity:
 			self.p_enc.eval()
 			with torch.no_grad():
 				step = 200
-				for i in tqdm(range(0, len(samples), step), desc="Encode query and passage"):
-					start, end = i, min(i + step, len(samples))
+				for i in tqdm(range(0, len(dataset), step), desc="Encode query and passage"):
+					start, end = i, min(i + step, len(dataset))
 					q = self.tokenizer(queries[start:end], return_tensors="pt", padding=True,
 					                   truncation=True, return_token_type_ids=False, max_length=32).to(self.device)
 					p = self.tokenizer(passages[start:end], return_tensors="pt", padding=True,
 					                   truncation=True, return_token_type_ids=False, max_length=128).to(self.device)
-					self.query[start:end] = self.q_enc(**q).last_hidden_state[:, 0]
-					self.passage[:, start:end] = self.p_enc(**p).last_hidden_state[:, 0].T
+					q_out = self.q_enc(**q, output_hidden_states=True)
+					p_out = self.p_enc(**p, output_hidden_states=True)
+					self.query[start:end] = (q_out.hidden_states[0][:, 0] + q_out.hidden_states[-1][:, 0]) / 2
+					self.passage[:, start:end] = ((p_out.hidden_states[0][:, 0] + p_out.hidden_states[-1][:, 0]) / 2).T
 
 	def get_sim(self, qid=None, pid=None):
 		if qid is not None and pid is not None:
@@ -51,7 +59,7 @@ class Similarity:
 
 	def save(self, file: str):
 		query = self.query.cpu().detach().numpy()
-		passage = self.passage.cpu().detach().numpy()
+		passage = self.passage.cpu().detach().numpy().T
 		np.savez_compressed(file, query=query, passage=passage)
 
 
@@ -206,8 +214,8 @@ class AdaptiveBatchSampling:
 			T = np.load(os.path.join(resume_from_checkpoint, "T.npy"))
 			T = [x for x in T]
 			hardness_log = np.loadtxt(os.path.join(resume_from_checkpoint, "hardness.txt")).tolist()
-			progress.update(len(T)*batch_size)
-			last_save_step = len(T)*batch_size
+			progress.update(len(T) * batch_size)
+			last_save_step = len(T) * batch_size
 		else:
 			hardness_log = []
 			last_save_step = 0
