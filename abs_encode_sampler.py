@@ -17,7 +17,6 @@ class AdaptiveBatchSampler(Sampler[int]):
 	             tokenizer: PreTrainedTokenizerBase,
 	             sim_cache_file: str = None,
 	             batch_size=8,
-	             checkpoint_step=500,
 	             resume_from_checkpoint=None):
 
 		super().__init__(data_source=dataset)
@@ -38,7 +37,6 @@ class AdaptiveBatchSampler(Sampler[int]):
 
 		self.dataset = dataset
 		self.batch_size = batch_size
-		self.checkpoint_step = checkpoint_step
 		self.p_enc = p_enc
 		self.q_enc = q_enc
 		self.tokenizer = tokenizer
@@ -94,7 +92,7 @@ class AdaptiveBatchSampler(Sampler[int]):
 		self.sim.save(os.path.join(checkpoint_dir, "sim.npz"))
 
 	def reset(self):
-		self.sim = Similarity(q_enc=q_enc, p_enc=p_enc, tokenizer=self.tokenizer, dataset=self.dataset)
+		self.sim = Similarity(q_enc=self.q_enc, p_enc=self.p_enc, tokenizer=self.tokenizer, dataset=self.dataset)
 
 	def __iter__(self):
 		yield from self.T

@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoModel, PreTrainedModel, DataCollator
 	TrainerCallback, TrainerState, TrainerControl
 from transformers.modeling_outputs import ModelOutput
 
-from abs_sampler import AdaptiveBatchSampler
+from abs_bm25_sampler import AdaptiveBatchSampler
 from metrics import ComputeMetrics
 from trainer import DenseTrainer
 
@@ -237,14 +237,13 @@ if __name__ == '__main__':
 	p_enc = copy.deepcopy(q_enc)
 	LTR = ListNet(input_dim=768 * 2)
 	model = CondenserLTR(q_enc=q_enc, p_enc=p_enc, ltr=LTR, psg_per_qry=8)
-	abs_sampler = AdaptiveBatchSampler(dataset=train_set, q_enc=q_enc, p_enc=p_enc, tokenizer=tokenizer,
-	                                   sim_cache_file="Dataset/sim_cache_1000.npz")
+	abs_sampler = AdaptiveBatchSampler(dataset=train_set, tokenizer=tokenizer)
 
 	training_args = TrainingArguments("model_output",
 	                                  overwrite_output_dir=True,
 	                                  learning_rate=5e-6,
 	                                  num_train_epochs=10,
-	                                  per_device_train_batch_size=16,
+	                                  per_device_train_batch_size=8,
 	                                  evaluation_strategy='steps',
 	                                  save_strategy="steps",
 	                                  save_total_limit=10,

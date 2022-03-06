@@ -1,13 +1,142 @@
 import math
 import os
+from collections import Counter
 
 import numpy as np
-import pandas as pd
 import torch
 from datasets import load_from_disk, Dataset
+from torch.utils.data import Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
-from collections import Counter
+
+
+class AdaptiveBatchSampler(Sampler[int]):
+	"""
+	AdaptiveBatchSampler based on BM25 similarity.
+	This sampler must be used together with the provided DenseTrainer.
+
+	Dataset Format Requirement:
+	Column: ["id": int, "query": str, "positives": str]
+
+	Sampler output: A list of id. e.g. [1,43,5,23,12,42,53,55]
+	"""
+
+	def __init__(self,
+	             dataset: Dataset,
+	             tokenizer: PreTrainedTokenizerBase,
+	             batch_size: int = 8,
+	             resume_from_checkpoint: str = None):
+		"""
+		:param dataset: dataset to sample
+		:param tokenizer: tokenizer that used in the model
+		:param batch_size: number of samples pair in a batch
+		:param resume_from_checkpoint: directory of training checkpoint to resume from
+		"""
+
+		super().__init__(data_source=dataset)
+
+		self.dataset = dataset
+		self.batch_size = batch_size
+		self.tokenizer = tokenizer
+
+		self.sim = BM25(dataset['positives'], tokenizer=tokenizer)
+		self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+		self.query = self.tokenizer(dataset['query'], return_tensors="pt", padding=True, max_length=32,
+		                            return_attention_mask=False, add_special_tokens=False, truncation=True,
+		                            return_token_type_ids=False).input_ids.to(self.device)
+
+		if resume_from_checkpoint:
+			self.U = np.load(os.path.join(resume_from_checkpoint, "U.npy"))
+			self.T = [x.tolist() for x in np.load(os.path.join(resume_from_checkpoint, "T.npy"))]
+			self.hardness_log = np.loadtxt(os.path.join(resume_from_checkpoint, "hardness.txt")).tolist()
+		else:
+			self.hardness_log = []
+			self.U = np.arange(len(dataset), dtype=np.int32)
+			self.T = []
+
+		# Find passages that are answers to multiple questions
+		dup_p = {}
+		passage_set = {}
+		for i in range(len(dataset)):
+			passage = dataset[i]['positives']
+			if passage in passage_set:
+				passage_set[passage].add(i)
+				if len(passage_set[passage]) > 1:
+					dup_p[passage] = passage_set[passage]
+			else:
+				passage_set[passage] = {i}
+
+		self.dup_set = {}
+		for dup_set in dup_p.values():
+			for idx in dup_set:
+				self.dup_set[idx] = dup_set - {idx}
+
+	@staticmethod
+	def get_remove(cache):
+		sim_arr = cache.get()
+		diff = torch.sum(sim_arr, dim=1) + torch.sum(sim_arr, dim=0)
+		min_idx = torch.argmin(diff)
+		pair_remove, sub = cache.qid[min_idx], diff[min_idx]
+		return pair_remove, sub
+
+	@staticmethod
+	def get_add(current_dataset, pair_remove, remain_dataset, cache_b_u=None, cache_u_b=None):
+		s1 = cache_u_b.get().sum(axis=1)
+		s1 -= cache_u_b.get_passage_sim(pair_remove)
+		idx = [cache_u_b.qid2rowid[x] for x in current_dataset]
+		s1[idx] = -np.inf
+
+		s2 = cache_b_u.get().sum(axis=0)
+		s2 -= cache_b_u.get_query_sim(pair_remove)
+		idx = [cache_b_u.pid2colid[x] for x in current_dataset]
+		s2[idx] = -np.inf
+
+		diff = s1 + s2
+		max_idx = torch.argmax(diff)
+		pair_add, add = remain_dataset[max_idx], diff[max_idx]
+
+		return pair_add, add
+
+	def save_checkpoint(self, checkpoint_dir):
+		os.makedirs(checkpoint_dir, exist_ok=True)
+		np.save(os.path.join(checkpoint_dir, "U.npy"), self.U)
+		np.save(os.path.join(checkpoint_dir, "T.npy"), np.vstack(self.T))
+		np.savetxt(os.path.join(checkpoint_dir, "hardness.txt"), np.array(self.hardness_log))
+
+	def reset(self):
+		pass
+
+	def __iter__(self):
+		yield from self.T
+
+		total = len(self.dataset) // self.batch_size - len(self.T)
+		for i in range(total):
+			B = np.random.choice(self.U, size=self.batch_size, replace=False)
+			cache_B = SimilarityCache(self.sim, self.query, self.dup_set, B, B)
+			cache_B_U = SimilarityCache(self.sim, self.query, self.dup_set, B, self.U)
+			cache_U_B = SimilarityCache(self.sim, self.query, self.dup_set, self.U, B)
+			hardness_B = cache_B.get().sum()
+			while True:
+				d_r, sub = self.get_remove(cache_B)
+				d_a, add = self.get_add(B, d_r, self.U, cache_b_u=cache_B_U, cache_u_b=cache_U_B)
+				hardness_B_tem = hardness_B - sub + add
+				if hardness_B_tem > hardness_B:
+					B = np.setdiff1d(B, d_r)
+					B = np.append(B, d_a)
+					hardness_B = hardness_B_tem
+					cache_B.swap_query(d_r, d_a)
+					cache_B.swap_passage(d_r, d_a)
+					cache_B_U.swap_query(d_r, d_a)
+					cache_U_B.swap_passage(d_r, d_a)
+				else:
+					break
+			self.T.append(B.tolist())
+			self.U = np.setdiff1d(self.U, B)
+			self.hardness_log.append(hardness_B.item())
+			yield B.tolist()
+
+	def __len__(self):
+		return len(self.dataset) // self.batch_size
 
 
 class BM25(object):
@@ -175,141 +304,20 @@ class SimilarityCache:
 		return self.cache[:, self.pid2colid[pid]]
 
 
-class AdaptiveBatchSampling:
-	def __init__(self, dataset: Dataset, tokenizer: PreTrainedTokenizerBase):
-		self.dataset = dataset
-		self.tokenizer = tokenizer
-		self.bm25 = BM25([x['positives'] for x in dataset], tokenizer=self.tokenizer)
-		self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-		self.query = self.tokenizer(dataset['query'], return_tensors="pt", padding=True, max_length=32,
-		                            return_attention_mask=False, add_special_tokens=False, truncation=True,
-		                            return_token_type_ids=False).input_ids.to(self.device)
-
-		# Find passages that are answers to multiple questions
-		dup_p = {}
-		passage_set = {}
-		for i in range(len(dataset)):
-			passage = dataset[i]['positives']
-			if passage in passage_set:
-				passage_set[passage].add(i)
-				if len(passage_set[passage]) > 1:
-					dup_p[passage] = passage_set[passage]
-			else:
-				passage_set[passage] = {i}
-
-		self.dup_set = {}
-		for dup_set in dup_p.values():
-			for idx in dup_set:
-				self.dup_set[idx] = dup_set - {idx}
-
-	@staticmethod
-	def get_remove(cache):
-		sim_arr = cache.get()
-		diff = torch.sum(sim_arr, dim=1) + torch.sum(sim_arr, dim=0)
-		min_idx = torch.argmin(diff)
-		pair_remove, sub = cache.qid[min_idx], diff[min_idx]
-		return pair_remove, sub
-
-	@staticmethod
-	def get_add(current_dataset, pair_remove, remain_dataset, cache_b_u=None, cache_u_b=None):
-		s1 = cache_u_b.get().sum(axis=1)
-		s1 -= cache_u_b.get_passage_sim(pair_remove)
-		idx = [cache_u_b.qid2rowid[x] for x in current_dataset]
-		s1[idx] = -np.inf
-
-		s2 = cache_b_u.get().sum(axis=0)
-		s2 -= cache_b_u.get_query_sim(pair_remove)
-		idx = [cache_b_u.pid2colid[x] for x in current_dataset]
-		s2[idx] = -np.inf
-
-		diff = s1 + s2
-		max_idx = torch.argmax(diff)
-		pair_add, add = remain_dataset[max_idx], diff[max_idx]
-
-		return pair_add, add
-
-	def save_result(self, T, output_file):
-		result = []
-		for batch in T:
-			for qid in batch:
-				qid = int(qid)
-				query_text = self.dataset[qid]['query']
-				passages = []
-				for pid in batch:
-					pid = int(pid)
-					if pid != qid:
-						passages.append(self.dataset[pid]['positives'])
-				passages = [self.dataset[qid]['positives']] + passages
-				result.append([query_text, passages])
-		df = pd.DataFrame.from_records(result)
-		df.columns = ['query', 'passage']
-		df.to_json(output_file, orient="records", lines=True)
-
-	def solve(self, batch_size, output_dir=None, checkpoint_step=500, resume_from_checkpoint=None):
-		if output_dir:
-			os.makedirs(output_dir, exist_ok=True)
-
-		total = len(self.query) // batch_size * batch_size
-		progress = tqdm(total=total)
-
-		if resume_from_checkpoint is not None:
-			U = np.load(os.path.join(resume_from_checkpoint, "U.npy"))
-			T = np.load(os.path.join(resume_from_checkpoint, "T.npy"))
-			T = [x for x in T]
-			hardness_log = np.loadtxt(os.path.join(resume_from_checkpoint, "hardness.txt")).tolist()
-			progress.update(len(T) * batch_size)
-			last_save_step = len(T) * batch_size
-		else:
-			hardness_log = []
-			last_save_step = 0
-			U = np.arange(len(self.query), dtype=np.int32)
-			T = []
-
-		while U.shape[0] >= batch_size:
-			B = np.random.choice(U, size=batch_size, replace=False)
-			cache_B = SimilarityCache(self.bm25, self.query, self.dup_set, B, B)
-			hardness_B = cache_B.get().sum()
-			if U.shape[0] > batch_size:
-				cache_B_U = SimilarityCache(self.bm25, self.query, self.dup_set, B, U)
-				cache_U_B = SimilarityCache(self.bm25, self.query, self.dup_set, U, B)
-				while True:
-					d_r, sub = self.get_remove(cache_B)
-					d_a, add = self.get_add(B, d_r, U, cache_b_u=cache_B_U, cache_u_b=cache_U_B)
-					hardness_B_tem = hardness_B - sub + add
-					if hardness_B_tem > hardness_B:
-						B = np.setdiff1d(B, d_r)
-						B = np.append(B, d_a)
-						hardness_B = hardness_B_tem
-						cache_B.swap_query(d_r, d_a)
-						cache_B.swap_passage(d_r, d_a)
-						cache_B_U.swap_query(d_r, d_a)
-						cache_U_B.swap_passage(d_r, d_a)
-					else:
-						break
-
-			U = np.setdiff1d(U, B)
-			T.append(B)
-			hardness_log.append(hardness_B.item())
-			progress.update(batch_size)
-			if output_dir is not None and len(T) * batch_size - last_save_step >= checkpoint_step and len(U) != 0:
-				checkpoint_dir = os.path.join(output_dir, f'checkpoint_{len(T) * batch_size}')
-				os.makedirs(checkpoint_dir, exist_ok=True)
-				np.save(os.path.join(checkpoint_dir, "U.npy"), U)
-				np.save(os.path.join(checkpoint_dir, "T.npy"), np.vstack(T))
-				np.savetxt(os.path.join(checkpoint_dir, "hardness.txt"), np.array(hardness_log))
-				last_save_step = len(T) * batch_size
-
-		if output_dir:
-			output_file = os.path.join(output_dir, "abs.json")
-			hardness_file = os.path.join(output_dir, "hardness.txt")
-			np.savetxt(hardness_file, np.array(hardness_log))
-			self.save_result(T, output_file)
-
-		return T
-
-
 if __name__ == '__main__':
+	# Test Code
 	samples = load_from_disk("Dataset/sample_1000_raw")
 	tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
-	ABS = AdaptiveBatchSampling(samples, tokenizer)
-	batches = ABS.solve(8, output_dir="abs_output")
+	ABS = AdaptiveBatchSampler(dataset=samples, tokenizer=tokenizer)
+
+	it = iter(ABS)
+	for batch in range(len(ABS) - 50):
+		print(next(it))
+
+	ABS.save_checkpoint("abs_output/checkpoint_test")
+
+	ABS2 = AdaptiveBatchSampler(dataset=samples, tokenizer=tokenizer,
+	                            resume_from_checkpoint="abs_output/checkpoint_test")
+	for batch in ABS2:
+		print(batch)
+	ABS2.reset()
