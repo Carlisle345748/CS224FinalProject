@@ -24,16 +24,13 @@ class DenseOutput(ModelOutput):
 	p_reps: Tensor = None
 	loss: Tensor = None
 	scores: Tensor = None
-	hidden_loss: Tensor = None
 
 
 class CondenserLTR(nn.Module):
-	def __init__(self, q_enc: PreTrainedModel, p_enc: PreTrainedModel, ltr: nn.Module, psg_per_qry: int):
+	def __init__(self, q_enc: PreTrainedModel, p_enc: PreTrainedModel):
 		super().__init__()
 		self.q_enc = q_enc
 		self.p_enc = p_enc
-		self.ltr = ltr
-		self.psg_per_qry = psg_per_qry
 		self.loss = nn.CrossEntropyLoss()
 
 	def encode_query(self, query):
@@ -64,7 +61,8 @@ class CondenserLTR(nn.Module):
 
 		# Contractive loss
 		batch_size = q_reps.size(0)
-		q_idx_map = sum(map(lambda x: [x] * self.psg_per_qry, range(batch_size)), [])
+		psg_per_qry = int(p_reps.size(0) / q_reps.size(0))
+		q_idx_map = sum(map(lambda x: [x] * psg_per_qry, range(batch_size)), [])
 		scores = q_reps[q_idx_map] * p_reps
 		scores = torch.sum(scores, dim=1).view(batch_size, -1)
 		loss = self.loss(scores, labels)
@@ -227,6 +225,9 @@ class ABSCallBack(TrainerCallback):
 		if state.global_step != state.max_steps:
 			kwargs['train_dataloader'].batch_sampler.reset()
 
+	def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+		torch.cuda.empty_cache()
+
 
 if __name__ == '__main__':
 	train_set = load_from_disk("Dataset/sample_1000_raw").map(TrainSetPreprocessor(), with_indices=True)
@@ -236,7 +237,7 @@ if __name__ == '__main__':
 	q_enc = AutoModel.from_pretrained('Luyu/co-condenser-marco')
 	p_enc = copy.deepcopy(q_enc)
 	LTR = ListNet(input_dim=768 * 2)
-	model = CondenserLTR(q_enc=q_enc, p_enc=p_enc, ltr=LTR, psg_per_qry=8)
+	model = CondenserLTR(q_enc=q_enc, p_enc=p_enc)
 	abs_sampler = AdaptiveBatchSampler(dataset=train_set, tokenizer=tokenizer)
 
 	training_args = TrainingArguments("model_output",
