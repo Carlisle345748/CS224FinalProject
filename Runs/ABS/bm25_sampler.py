@@ -103,8 +103,12 @@ class AdaptiveBatchSampler(Sampler[int]):
 		np.save(os.path.join(checkpoint_dir, "T.npy"), np.vstack(self.T))
 		np.savetxt(os.path.join(checkpoint_dir, "hardness.txt"), np.array(self.hardness_log))
 
-	def reset(self):
+	def re_encode(self):
 		pass
+
+	def reset(self):
+		self.U = np.arange(len(self.dataset), dtype=np.int32)
+		self.T = []
 
 	def __iter__(self):
 		yield from self.T

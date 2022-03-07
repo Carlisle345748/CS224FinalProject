@@ -1,6 +1,5 @@
-import os.path
+import os
 
-import faiss
 import numpy as np
 import torch
 from datasets import load_from_disk, Dataset
@@ -11,25 +10,33 @@ from transformers import AutoTokenizer, AutoModel, PreTrainedModel, PreTrainedTo
 
 class AdaptiveBatchSampler(Sampler[int]):
 	"""
-	AdaptiveBatchSampler based on dot-product similarity.
-	Faiss and Beam Search are applied to this implementation.
+	AdaptiveBatchSampler based on Encode Vector dot-product similarity.
 	This sampler must be used together with the provided DenseTrainer.
 
 	Dataset Format Requirement:
 	Column: ["id": int, "query": str, "positives": str]
 
 	Sampler output: A list of id. e.g. [1,43,5,23,12,42,53,55]
-
 	"""
+
 	def __init__(self,
 	             dataset: Dataset,
 	             q_enc: PreTrainedModel,
 	             p_enc: PreTrainedModel,
 	             tokenizer: PreTrainedTokenizerBase,
-	             beam_search_range: int = 3,
 	             sim_cache_file: str = None,
 	             batch_size: int = 8,
 	             resume_from_checkpoint: str = None):
+		"""
+		:param dataset: dataset to sample
+		:param q_enc: model for query encoding
+		:param p_enc: model for passage encoding
+		:param tokenizer: model tokenizer
+		:param sim_cache_file: cache file containing encode query and passage.
+		If None, then re-encode query and passage on initialization
+		:param batch_size: number of samples in a batch
+		:param resume_from_checkpoint: directory of training checkpoint to resume from
+		"""
 
 		super().__init__(data_source=dataset)
 
@@ -48,16 +55,10 @@ class AdaptiveBatchSampler(Sampler[int]):
 			self.T = []
 
 		self.dataset = dataset
-		self.q_enc = q_enc
-		self.p_enc = p_enc
-		self.tokenizer = tokenizer
 		self.batch_size = batch_size
-		self.beam_search_range = beam_search_range
-
-		self.q_reps = self.sim.get_query().detach().cpu().numpy()
-		self.p_reps = self.sim.get_passage().detach().cpu().numpy()
-		self.qry_idx = FAISSIndex(self.q_reps)
-		self.psg_idx = FAISSIndex(self.p_reps)
+		self.p_enc = p_enc
+		self.q_enc = q_enc
+		self.tokenizer = tokenizer
 
 		# Find passages that are answers to multiple questions
 		dup_p = {}
@@ -77,33 +78,30 @@ class AdaptiveBatchSampler(Sampler[int]):
 				self.dup_set[idx] = dup_set - {idx}
 
 	@staticmethod
-	def get_remove(cache, beam_search_index):
+	def get_remove(cache):
 		sim_arr = cache.get()
 		diff = torch.sum(sim_arr, dim=1) + torch.sum(sim_arr, dim=0)
-		top_k = torch.topk(diff, k=beam_search_index)
-		return cache.qid[top_k.indices], top_k.values.cpu().numpy()
+		min_idx = torch.argmin(diff)
+		pair_remove, sub = cache.qid[min_idx], diff[min_idx]
+		return pair_remove, sub
 
 	@staticmethod
-	def get_add(self, batch_size, current_dataset, pair_remove, remain_dataset, search_range=100,
-	            beam_search_index=3):
-		if len(remain_dataset) <= 2:  # * batch_size * search_range:
-			candidates = remain_dataset
-		else:
-			# FAISS
-			_, candidates_1 = self.psg_idx.search(self.q_reps[current_dataset], top_k=search_range)
-			_, candidates_2 = self.qry_idx.search(self.p_reps[current_dataset], top_k=search_range)
-			candidates = np.union1d(candidates_1.flatten(), candidates_2.flatten())
-			candidates = np.intersect1d(candidates, remain_dataset)
-			candidates = np.setdiff1d(candidates, pair_remove)
+	def get_add(current_dataset, pair_remove, remain_dataset, cache_b_u=None, cache_u_b=None):
+		s1 = cache_u_b.get().sum(axis=1)
+		s1 -= cache_u_b.get_passage_sim(pair_remove)
+		idx = [cache_u_b.qid2rowid[x] for x in current_dataset]
+		s1[idx] = -np.inf
 
-		cache_b_u = SimilarityCache(self.sim, self.dup_set, current_dataset, candidates)
-		cache_u_b = SimilarityCache(self.sim, self.dup_set, candidates, current_dataset)
+		s2 = cache_b_u.get().sum(axis=0)
+		s2 -= cache_b_u.get_query_sim(pair_remove)
+		idx = [cache_b_u.pid2colid[x] for x in current_dataset]
+		s2[idx] = -np.inf
 
-		s1 = cache_u_b.get().sum(axis=1) - cache_u_b.get_passage_sim(pair_remove)
-		s2 = cache_b_u.get().sum(axis=0) - cache_b_u.get_query_sim(pair_remove)
+		diff = s1 + s2
+		max_idx = torch.argmax(diff)
+		pair_add, add = remain_dataset[max_idx], diff[max_idx]
 
-		top_k = torch.topk(s1 + s2, k=beam_search_index)
-		return candidates[top_k.indices], top_k.values.cpu().numpy()
+		return pair_add, add
 
 	def save_checkpoint(self, checkpoint_dir):
 		os.makedirs(checkpoint_dir, exist_ok=True)
@@ -112,57 +110,54 @@ class AdaptiveBatchSampler(Sampler[int]):
 		np.savetxt(os.path.join(checkpoint_dir, "hardness.txt"), np.array(self.hardness_log))
 		self.sim.save(os.path.join(checkpoint_dir, "sim.npz"))
 
-	def reset(self):
+	def re_encode(self):
 		self.sim = Similarity(q_enc=self.q_enc, p_enc=self.p_enc, tokenizer=self.tokenizer, dataset=self.dataset)
-		self.q_reps = self.sim.get_query().detach().cpu().numpy()
-		self.p_reps = self.sim.get_passage().detach().cpu().numpy()
-		self.qry_idx = FAISSIndex(self.q_reps)
-		self.psg_idx = FAISSIndex(self.p_reps)
 
-	def __len__(self):
-		return len(self.dataset) // self.batch_size
+	def reset(self):
+		self.T = []
+		self.U = np.arange(len(self.dataset), dtype=np.int32)
+
 
 	def __iter__(self):
 		yield from self.T
 
 		total = len(self.dataset) // self.batch_size - len(self.T)
-		for _ in range(total):
+		for i in range(total):
 			B = np.random.choice(self.U, size=self.batch_size, replace=False)
 			cache_B = SimilarityCache(self.sim, self.dup_set, B, B)
+			cache_B_U = SimilarityCache(self.sim, self.dup_set, B, self.U)
+			cache_U_B = SimilarityCache(self.sim, self.dup_set, self.U, B)
 			hardness_B = cache_B.get().sum()
-			if self.U.shape[0] > self.batch_size:
-				while True:
-					hardness_B_tem = 0
-					d_r, d_a = None, None
-					d_r_list, sub_list = self.get_remove(cache_B, self.beam_search_range)
-					for i in range(self.beam_search_range):
-						d_a_list, add_list = self.get_add(self, self.batch_size, B, d_r_list[i],
-						                                  self.U, 100, self.beam_search_range)
-						for j in range(self.beam_search_range):
-							if hardness_B - sub_list[i] + add_list[j] > hardness_B_tem:
-								hardness_B_tem = hardness_B - sub_list[i] + add_list[j]
-								d_r = d_r_list[i]
-								d_a = d_a_list[j]
-					if hardness_B_tem > hardness_B:
-						B = np.setdiff1d(B, d_r)
-						B = np.append(B, d_a)
-						hardness_B = hardness_B_tem
-						cache_B = SimilarityCache(self.sim, self.dup_set, B, B)
-					else:
-						break
-
+			while True:
+				d_r, sub = self.get_remove(cache_B)
+				d_a, add = self.get_add(B, d_r, self.U, cache_b_u=cache_B_U, cache_u_b=cache_U_B)
+				hardness_B_tem = hardness_B - sub + add
+				if hardness_B_tem > hardness_B:
+					B = np.setdiff1d(B, d_r)
+					B = np.append(B, d_a)
+					hardness_B = hardness_B_tem
+					cache_B.swap_query(d_r, d_a)
+					cache_B.swap_passage(d_r, d_a)
+					cache_B_U.swap_query(d_r, d_a)
+					cache_U_B.swap_passage(d_r, d_a)
+				else:
+					break
+			self.T.append(B.tolist())
 			self.U = np.setdiff1d(self.U, B)
-			self.T.append(B)
 			self.hardness_log.append(hardness_B.item())
 			yield B.tolist()
+
+	def __len__(self):
+		return len(self.dataset) // self.batch_size
+
 
 class Similarity:
 	def __init__(self,
 	             q_enc: PreTrainedModel = None,
 	             p_enc: PreTrainedModel = None,
-	             tokenizer=None,
-	             dataset=None,
-	             cache_file=None):
+	             tokenizer: PreTrainedTokenizerBase = None,
+	             dataset: Dataset = None,
+	             cache_file: str = None):
 
 		self.dataset = dataset
 		self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -172,11 +167,11 @@ class Similarity:
 
 		if cache_file is not None:
 			cache = np.load(cache_file)
-			self.query = torch.from_numpy(cache['query'])
-			self.passage = torch.from_numpy(cache['passage']).T
+			self.query = torch.from_numpy(cache['query']).to(self.device)
+			self.passage = torch.from_numpy(cache['passage']).T.to(self.device)
 		else:
-			self.query = torch.zeros(len(dataset), 768, dtype=torch.float32)
-			self.passage = torch.zeros(768, len(dataset), dtype=torch.float32)
+			self.query = torch.zeros(len(dataset), 768, dtype=torch.float32).to(self.device)
+			self.passage = torch.zeros(768, len(dataset), dtype=torch.float32).to(self.device)
 			queries = dataset['query']
 			passages = dataset['positives']
 
@@ -192,10 +187,8 @@ class Similarity:
 					                   truncation=True, return_token_type_ids=False, max_length=128).to(self.device)
 					q_out = self.q_enc(**q, output_hidden_states=True)
 					p_out = self.p_enc(**p, output_hidden_states=True)
-					q_rep = (q_out.hidden_states[0][:, 0] + q_out.hidden_states[-1][:, 0]) / 2
-					p_rep = ((p_out.hidden_states[0][:, 0] + p_out.hidden_states[-1][:, 0]) / 2).T
-					self.query[start:end] = q_rep.cpu()
-					self.passage[:, start:end] = p_rep.cpu()
+					self.query[start:end] = (q_out.hidden_states[0][:, 0] + q_out.hidden_states[-1][:, 0]) / 2
+					self.passage[:, start:end] = ((p_out.hidden_states[0][:, 0] + p_out.hidden_states[-1][:, 0]) / 2).T
 				torch.cuda.empty_cache()
 
 	def get_sim(self, qid=None, pid=None):
@@ -212,12 +205,6 @@ class Similarity:
 		query = self.query.cpu().detach().numpy()
 		passage = self.passage.cpu().detach().numpy().T
 		np.savez_compressed(file, query=query, passage=passage)
-
-	def get_query(self):
-		return self.query
-
-	def get_passage(self):
-		return self.passage.T
 
 
 class SimilarityCache:
@@ -254,6 +241,36 @@ class SimilarityCache:
 	def get(self):
 		return self.cache
 
+	def swap_query(self, old_qid, new_qid):
+		new_score = self.sim.get_sim([new_qid], self.pid)
+		if new_qid in self.pid2colid:
+			new_score[0, self.pid2colid[new_qid]] = 0
+		if new_qid in self.dup_set:
+			for dup_id in self.dup_set[new_qid]:
+				if dup_id in self.pid2colid:
+					new_score[0, self.pid2colid[dup_id]] = 0
+
+		row_idx = self.qid2rowid[old_qid]
+		self.cache[row_idx] = new_score
+		self.qid[row_idx] = new_qid
+		del self.qid2rowid[old_qid]
+		self.qid2rowid[new_qid] = row_idx
+
+	def swap_passage(self, old_pid, new_pid):
+		new_score = self.sim.get_sim(self.qid, [new_pid]).flatten()
+		if new_pid in self.qid2rowid:
+			new_score[self.qid2rowid[new_pid]] = 0
+		if new_pid in self.dup_set:
+			for dup_id in self.dup_set[new_pid]:
+				if dup_id in self.qid2rowid:
+					new_score[self.qid2rowid[dup_id]] = 0
+
+		col_idx = self.pid2colid[old_pid]
+		self.cache[:, col_idx] = new_score
+		self.pid[col_idx] = new_pid
+		del self.pid2colid[old_pid]
+		self.pid2colid[new_pid] = col_idx
+
 	def get_query_sim(self, qid):
 		return self.cache[self.qid2rowid[qid]]
 
@@ -261,44 +278,16 @@ class SimilarityCache:
 		return self.cache[:, self.pid2colid[pid]]
 
 
-class FAISSIndex:
-	def __init__(self, reps: np.ndarray):
-		self.dim = reps.shape[1]
-		index = faiss.index_factory(self.dim, "IVF64,Flat,RFlat", faiss.METRIC_INNER_PRODUCT)
-		index.nprobe = 64
-		self.index = index
-		self.train(reps)
-		self.add(reps)
-
-	def search(self, reps: np.ndarray, top_k: int):
-		if not reps.flags.c_contiguous:
-			reps = np.asarray(reps, order="C")
-		return self.index.search(x=reps, k=top_k)
-
-	def add(self, reps: np.ndarray):
-		if not reps.flags.c_contiguous:
-			reps = np.asarray(reps, order="C")
-		self.index.add(reps)
-
-	def train(self, reps: np.ndarray):
-		if not reps.flags.c_contiguous:
-			reps = np.asarray(reps, order="C")
-		self.index.train(reps)
-
-	def __len__(self):
-		return self.index.ntotal
-
-
-if __name__ == "__main__":
-	samples = load_from_disk("../Dataset/sample_1000_raw")
+if __name__ == '__main__':
+	samples = load_from_disk("Dataset/sample_1000_raw")
 	tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
 	q_enc = AutoModel.from_pretrained('Luyu/co-condenser-marco')
 	p_enc = AutoModel.from_pretrained('Luyu/co-condenser-marco')
 	ABS = AdaptiveBatchSampler(dataset=samples, q_enc=q_enc, p_enc=p_enc,
-	                           tokenizer=tokenizer, sim_cache_file="../Dataset/sim_cache_1000.npz")
+	                           tokenizer=tokenizer, sim_cache_file="Dataset/sim_cache_1000.npz")
 
 	it = iter(ABS)
-	for batch in range(len(ABS)):
+	for batch in range(len(ABS) - 50):
 		print(next(it))
 
 	ABS.save_checkpoint("abs_output/checkpoint_test")

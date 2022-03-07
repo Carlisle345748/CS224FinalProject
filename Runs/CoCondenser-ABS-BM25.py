@@ -5,8 +5,9 @@ from datasets import load_dataset
 from torch import Tensor, nn
 from transformers import PreTrainedModel, AutoTokenizer, AutoModel, TrainingArguments
 
+from ABS.bm25_sampler import AdaptiveBatchSampler
 from ABS.trainer import DenseTrainer
-from ABS.util import ComputeMetrics, DenseOutput, EvalCollactor
+from ABS.util import ComputeMetrics, EvalCollactor, DenseOutput, ABSCallBack, ABSCollactor
 
 
 class CondenserLTR(nn.Module):
@@ -46,13 +47,16 @@ class CondenserLTR(nn.Module):
 
 
 if __name__ == '__main__':
-	data = load_dataset("Carlisle/msmarco-passage-non-abs")
+	train_set = load_dataset("Carlisle/msmarco-passage-abs", split='train')
+	dev_set = load_dataset("Carlisle/msmarco-passage-non-abs", split='dev')  # dev set is stored in non-abs dataset
 	tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
 	q_enc = AutoModel.from_pretrained('Luyu/co-condenser-marco')
 	p_enc = copy.deepcopy(q_enc)
 	model = CondenserLTR(q_enc=q_enc, p_enc=p_enc)
 
-	training_args = TrainingArguments("model_output/Non-ABS",
+	abs_sampler = AdaptiveBatchSampler(dataset=train_set, tokenizer=tokenizer)
+
+	training_args = TrainingArguments("model_output/ABS_BM25",
 	                                  overwrite_output_dir=True,
 	                                  learning_rate=5e-6,
 	                                  num_train_epochs=3,
@@ -63,6 +67,8 @@ if __name__ == '__main__':
 	                                  logging_steps=10,
 	                                  eval_steps=1000,
 	                                  save_steps=1000,
+	                                  lr_scheduler_type="cosine",
+	                                  warmup_steps=len(train_set),
 	                                  load_best_model_at_end=True,
 	                                  metric_for_best_model="mmr",
 	                                  remove_unused_columns=False)
@@ -70,12 +76,15 @@ if __name__ == '__main__':
 	trainer = DenseTrainer(
 		model=model,
 		args=training_args,
-		train_dataset=data['train'],
-		eval_dataset=data['dev'],
+		train_dataset=train_set,
+		eval_dataset=dev_set,
 		data_collator=EvalCollactor(tokenizer=tokenizer),
+		abs_sampler=abs_sampler,
+		abs_collator=ABSCollactor(tokenizer),
 		tokenizer=tokenizer,
 		compute_metrics=ComputeMetrics(),
 	)
 
+	trainer.add_callback(ABSCallBack())
 	trainer.train()
 	trainer.save_model()

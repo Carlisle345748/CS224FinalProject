@@ -12,6 +12,7 @@ from torch import Tensor
 from transformers import AutoTokenizer, AutoModel, PreTrainedModel, DataCollatorWithPadding, TrainingArguments, \
 	TrainerCallback, TrainerState, TrainerControl
 from transformers.modeling_outputs import ModelOutput
+from transformers.optimization import get_cosine_with_hard_restarts_schedule_with_warmup
 
 from abs_bm25_sampler import AdaptiveBatchSampler
 from metrics import ComputeMetrics
@@ -243,7 +244,7 @@ if __name__ == '__main__':
 	training_args = TrainingArguments("model_output",
 	                                  overwrite_output_dir=True,
 	                                  learning_rate=5e-6,
-	                                  num_train_epochs=10,
+	                                  num_train_epochs=3,
 	                                  per_device_train_batch_size=8,
 	                                  evaluation_strategy='steps',
 	                                  save_strategy="steps",
@@ -253,6 +254,8 @@ if __name__ == '__main__':
 	                                  save_steps=500,
 	                                  load_best_model_at_end=True,
 	                                  metric_for_best_model="mmr",
+	                                  lr_scheduler_type="cosine",
+	                                  warmup_steps=1,
 	                                  remove_unused_columns=False)
 
 	trainer = DenseTrainer(
