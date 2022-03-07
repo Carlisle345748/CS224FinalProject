@@ -5,7 +5,7 @@ from datasets import load_dataset
 from torch import Tensor, nn
 from transformers import PreTrainedModel, AutoTokenizer, AutoModel, TrainingArguments
 
-from ABS.bm25_sampler import AdaptiveBatchSampler
+from ABS.faiss_beamsearch import AdaptiveBatchSampler
 from ABS.trainer import DenseTrainer
 from ABS.util import ComputeMetrics, EvalCollactor, DenseOutput, ABSCallBack, ABSCollactor
 
@@ -57,9 +57,9 @@ if __name__ == '__main__':
 	p_enc = copy.deepcopy(q_enc)
 	model = CondenserLTR(q_enc=q_enc, p_enc=p_enc)
 
-	abs_sampler = AdaptiveBatchSampler(dataset=train_set, tokenizer=tokenizer)
+	abs_sampler = AdaptiveBatchSampler(dataset=train_set, q_enc=q_enc, p_enc=p_enc, tokenizer=tokenizer)
 
-	training_args = TrainingArguments("model_output/ABS_BM25",
+	training_args = TrainingArguments("model_output/ABS_Encode",
 	                                  overwrite_output_dir=True,
 	                                  learning_rate=5e-6,
 	                                  num_train_epochs=EPOCH,
@@ -71,6 +71,7 @@ if __name__ == '__main__':
 	                                  eval_steps=1000,
 	                                  save_steps=1000,
 	                                  lr_scheduler_type="constant",
+	                                  warmup_steps=len(train_set) // BATCH // 3,
 	                                  load_best_model_at_end=True,
 	                                  metric_for_best_model="mmr",
 	                                  remove_unused_columns=False)

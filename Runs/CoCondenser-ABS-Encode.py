@@ -47,6 +47,9 @@ class CondenserLTR(nn.Module):
 
 
 if __name__ == '__main__':
+	EPOCH = 3
+	BATCH = 8
+
 	train_set = load_dataset("Carlisle/msmarco-passage-abs", split='train')
 	dev_set = load_dataset("Carlisle/msmarco-passage-non-abs", split='dev')  # dev set is stored in non-abs dataset
 	tokenizer = AutoTokenizer.from_pretrained("Luyu/co-condenser-marco")
@@ -59,16 +62,16 @@ if __name__ == '__main__':
 	training_args = TrainingArguments("model_output/ABS_Encode",
 	                                  overwrite_output_dir=True,
 	                                  learning_rate=5e-6,
-	                                  num_train_epochs=3,
-	                                  per_device_train_batch_size=8,
+	                                  num_train_epochs=EPOCH,
+	                                  per_device_train_batch_size=BATCH,
 	                                  evaluation_strategy='steps',
 	                                  save_strategy="steps",
 	                                  save_total_limit=3,
 	                                  logging_steps=10,
 	                                  eval_steps=1000,
 	                                  save_steps=1000,
-	                                  lr_scheduler_type="cosine",
-	                                  warmup_steps=len(train_set),
+	                                  lr_scheduler_type="constant",
+	                                  warmup_steps=len(train_set) // BATCH // 3,
 	                                  load_best_model_at_end=True,
 	                                  metric_for_best_model="mmr",
 	                                  remove_unused_columns=False)
